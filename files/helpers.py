@@ -544,16 +544,44 @@ def get_base_ffmpeg_command(
         "force_divisible_by=2",
         "flags=lanczos",
     ]
-    scale_filter_str = "scale=" + ":".join(scale_filter_opts)
+    ## No Accell ## scale_filter_str = "scale=" + ":".join(scale_filter_opts)
+    scale_filter_str = "scale_vaapi=" + ":".join(scale_filter_opts)
     filters.append(scale_filter_str)
 
-    fps_str = f"fps=fps={target_fps}"
-    filters.append(fps_str)
+    ## No Accell ## fps_str = f"fps=fps={target_fps}"
+    ## No Accell ## filters.append(fps_str)
+    ## QSV has this removed
 
     filters_str = ",".join(filters)
 
+    ## No Accell ## base_cmd = [
+    ## No Accell ##     settings.FFMPEG_COMMAND,
+    ## No Accell ##     "-y",
+    ## No Accell ##     "-i",
+    ## No Accell ##     input_file,
+    ## No Accell ##     "-c:v",
+    ## No Accell ##     encoder,
+    ## No Accell ##     "-filter:v",
+    ## No Accell ##     filters_str,
+    ## No Accell ##     "-pix_fmt",
+    ## No Accell ##     "yuv420p",
+    ## No Accell ## ]
+
+    ## No Accell ## if enc_type == "twopass":
+    ## No Accell ##     base_cmd.extend(["-b:v", str(target_rate) + "k"])
+    ## No Accell ## elif enc_type == "crf":
+    ## No Accell ##     base_cmd.extend(["-crf", str(VIDEO_CRFS[codec])])
+    ## No Accell ##     if encoder == "libvpx-vp9":
+    ## No Accell ##         base_cmd.extend(["-b:v", str(target_rate) + "k"])
+
     base_cmd = [
         settings.FFMPEG_COMMAND,
+        "-hwaccel",
+        "vaapi",
+        "-hwaccel_output_format",
+        "vaapi",
+        "-vaapi_device",
+        "/dev/dri/renderD128",
         "-y",
         "-i",
         input_file,
@@ -562,14 +590,14 @@ def get_base_ffmpeg_command(
         "-filter:v",
         filters_str,
         "-pix_fmt",
-        "yuv420p",
+        "vaapi",
     ]
 
     if enc_type == "twopass":
         base_cmd.extend(["-b:v", str(target_rate) + "k"])
     elif enc_type == "crf":
-        base_cmd.extend(["-crf", str(VIDEO_CRFS[codec])])
-        if encoder == "libvpx-vp9":
+        base_cmd.extend(["-q","25","-rc_mode","3","-b:v",str(int(int(target_rate) * MAX_RATE_MULTIPLIER)) + "k"])
+        if encoder == "vp9_vaapi":
             base_cmd.extend(["-b:v", str(target_rate) + "k"])
 
     if has_audio:
@@ -600,6 +628,15 @@ def get_base_ffmpeg_command(
     elif encoder in ["libx264"]:
         preset = X26x_PRESET
     elif encoder in ["libx265"]:
+        preset = X265_PRESET
+    elif encoder == "vp9_vaapi":
+        if pass_number == 1:
+            speed = 4
+        else:
+            speed = VP9_SPEED
+    elif encoder in ["h264_vaapi"]:
+        preset = X26x_PRESET
+    elif encoder in ["hevc_vaapi"]:
         preset = X265_PRESET
     if target_height >= 720:
         preset = X26x_PRESET_BIG_HEIGHT
@@ -679,6 +716,72 @@ def get_base_ffmpeg_command(
         if enc_type == "twopass":
             cmd.extend(["-passlogfile", pass_file, "-pass", pass_number])
 
+    elif encoder == "h264_vaapi":
+        level = "4.2" if target_height <= 1080 else "5.2"
+
+        cmd.extend(
+            [
+#                "-maxrate",
+#                str(int(int(target_rate) * MAX_RATE_MULTIPLIER)) + "k",
+                "-bufsize",
+                str(int(int(target_rate) * BUF_SIZE_MULTIPLIER)) + "k",
+                "-force_key_frames",
+                "expr:gte(t,n_forced*" + str(KEYFRAME_DISTANCE) + ")",
+                "-preset",
+                preset,
+                "-profile:v",
+                VIDEO_PROFILES[codec],
+                "-level",
+                level,
+            ]
+        )
+
+        if enc_type == "twopass":
+            cmd.extend(["-passlogfile", pass_file, "-pass", pass_number])
+
+    elif encoder == "hevc_vaapi":
+        x265_params = [
+#            "vbv-maxrate=" + str(int(int(target_rate) * MAX_RATE_MULTIPLIER)),
+            "vbv-bufsize=" + str(int(int(target_rate) * BUF_SIZE_MULTIPLIER)),
+            "keyint=" + str(keyframe_distance * 2),
+            "keyint_min=" + str(keyframe_distance),
+        ]
+
+        if enc_type == "twopass":
+            x265_params.extend(["stats=" + str(pass_file), "pass=" + str(pass_number)])
+
+        cmd.extend(
+            [
+                "-force_key_frames",
+                "expr:gte(t,n_forced*" + str(KEYFRAME_DISTANCE) + ")",
+                "-preset",
+                preset,
+                "-profile:v",
+                VIDEO_PROFILES[codec],
+            ]
+        )
+    elif encoder == "vp9_vaapi":
+        cmd.extend(
+            [
+                "-g",
+                str(keyframe_distance),
+                "-keyint_min",
+                str(keyframe_distance),
+#                "-maxrate",
+#                str(int(int(target_rate) * MAX_RATE_MULTIPLIER)) + "k",
+                "-minrate",
+                str(int(int(target_rate) * MIN_RATE_MULTIPLIER)) + "k",
+                "-bufsize",
+                str(int(int(target_rate) * BUF_SIZE_MULTIPLIER)) + "k",
+                "-speed",
+                speed,
+                #            '-deadline', 'realtime',
+            ]
+        )
+
+        if enc_type == "twopass":
+            cmd.extend(["-passlogfile", pass_file, "-pass", pass_number])
+
     cmd.extend(
         [
             "-strict",
@@ -703,14 +806,26 @@ def produce_ffmpeg_commands(media_file, media_info, resolution, codec, output_fi
     except BaseException:
         media_info = {}
 
+    ## No Accell ## if codec == "h264":
+    ## No Accell ##     encoder = "libx264"
+    ## No Accell ##     # ext = "mp4"
+    ## No Accell ## elif codec in ["h265", "hevc"]:
+    ## No Accell ##     encoder = "libx265"
+    ## No Accell ##     # ext = "mp4"
+    ## No Accell ## elif codec == "vp9":
+    ## No Accell ##     encoder = "libvpx-vp9"
+    ## No Accell ##     # ext = "webm"
+    ## No Accell ## else:
+    ## No Accell ##     return False
+
     if codec == "h264":
-        encoder = "libx264"
+        encoder = "h264_vaapi"
         # ext = "mp4"
     elif codec in ["h265", "hevc"]:
-        encoder = "libx265"
+        encoder = "hevc_vaapi"
         # ext = "mp4"
     elif codec == "vp9":
-        encoder = "libvpx-vp9"
+        encoder = "vp9_vaapi"
         # ext = "webm"
     else:
         return False
